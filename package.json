@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "seed": "node server/seed.js",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate --schema=./server/prisma/schema.prisma"
   },
   "dependencies": {
     "@hookform/resolvers": "^4.1.2",

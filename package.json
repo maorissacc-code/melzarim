@@ -8,8 +8,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "seed": "node server/seed.js",
-    "postinstall": "prisma generate --schema=./server/prisma/schema.prisma"
+    "seed": "node seed.js",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@hookform/resolvers": "^4.1.2",

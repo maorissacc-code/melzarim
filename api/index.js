@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { PrismaClient } from '@prisma/client';
+import { MongoClient, ObjectId } from 'mongodb';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import path from 'path';
@@ -13,7 +13,16 @@ import twilio from 'twilio';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const prisma = new PrismaClient();
+// MongoDB Setup
+let dbInstance = null;
+async function connectDB() {
+  if (dbInstance) return dbInstance;
+  const client = new MongoClient(process.env.DATABASE_URL);
+  await client.connect();
+  dbInstance = client.db(); // Uses database name from URL
+  return dbInstance;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'secret_key_change_me';
@@ -28,7 +37,6 @@ const normalizePhone = (phone) => {
 };
 
 // Serve Static Files (Frontend)
-// Hostinger usually expects the backend to serve the frontend if it's a VPS or single Node app
 app.use(express.static(path.join(__dirname, '../dist'), {
   setHeaders: (res) => {
     res.set('Cache-Control', 'no-store');
@@ -53,15 +61,18 @@ const authenticate = async (req, res, next) => {
 // --- SESSION VALIDATION ---
 app.post('/api/functions/validateSession', authenticate, async (req, res) => {
   try {
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    const db = await connectDB();
+    const user = await db.collection('users').findOne({ _id: new ObjectId(req.user.id) });
+
     if (!user) {
       return res.status(401).json({ valid: false });
     }
 
     const userResponse = {
       ...user,
-      roles: user.roles ? JSON.parse(user.roles) : [],
-      role_prices: user.role_prices ? JSON.parse(user.role_prices) : {},
+      id: user._id.toString(),
+      roles: user.roles ? (typeof user.roles === 'string' ? JSON.parse(user.roles) : user.roles) : [],
+      role_prices: user.role_prices ? (typeof user.role_prices === 'string' ? JSON.parse(user.role_prices) : user.role_prices) : {},
       has_password: !!user.password
     };
 
@@ -75,11 +86,14 @@ app.post('/api/functions/validateSession', authenticate, async (req, res) => {
 
 app.post('/api/functions/listWaiters', async (req, res) => {
   try {
-    const users = await prisma.user.findMany();
+    const db = await connectDB();
+    const users = await db.collection('users').find({}).toArray();
+
     const formattedUsers = users.map(u => ({
       ...u,
-      roles: u.roles ? JSON.parse(u.roles) : [],
-      role_prices: u.role_prices ? JSON.parse(u.role_prices) : {},
+      id: u._id.toString(),
+      roles: u.roles ? (typeof u.roles === 'string' ? JSON.parse(u.roles) : u.roles) : [],
+      role_prices: u.role_prices ? (typeof u.role_prices === 'string' ? JSON.parse(u.role_prices) : u.role_prices) : {},
       has_password: !!u.password
     }));
     res.json({ users: formattedUsers });
@@ -92,7 +106,9 @@ app.post('/api/functions/listWaiters', async (req, res) => {
 
 // Helper
 const generateToken = (user) => {
-  return jwt.sign({ id: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '7d' });
+  // Use _id from Mongo doc or id from mapped user
+  const userId = user._id ? user._id.toString() : user.id;
+  return jwt.sign({ id: userId, phone: user.phone }, JWT_SECRET, { expiresIn: '7d' });
 };
 
 // Initialize Twilio client if credentials are available
@@ -104,42 +120,41 @@ const twilioClient = accountSid && authToken && twilioPhoneNumber
   ? twilio(accountSid, authToken)
   : null;
 
-// Send Verification Code (Test Mode)
+// Send Verification Code
 app.post('/api/functions/sendVerificationCode', async (req, res) => {
   const { phone: rawPhone } = req.body;
   if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
 
   const phone = normalizePhone(rawPhone);
-
-  // Use a fixed test code for development
-  const code = '123456';
+  const code = '123456'; // Fixed for dev
   const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
 
   try {
-    // Skip Twilio in test mode
-    console.log(`[TEST MODE] Verification code for ${phone}: ${code}`);
+    const db = await connectDB();
+    const users = db.collection('users');
 
-    // Upsert user to store code
-    await prisma.user.upsert({
-      where: { phone },
-      update: { verification_code: code, verification_code_expires: expires },
-      create: { phone, verification_code: code, verification_code_expires: expires }
-    });
+    await users.updateOne(
+      { phone },
+      {
+        $set: {
+          verification_code: code,
+          verification_code_expires: expires,
+          updated_at: new Date()
+        },
+        $setOnInsert: {
+          created_at: new Date(),
+          available: true
+        }
+      },
+      { upsert: true }
+    );
 
-    // Always return the code in test mode
-    res.json({
-      success: true,
-      message: 'Test verification code generated',
-      development: true,
-      code: code
-    });
+    console.log(`[TEST MODE] Code for ${phone}: ${code}`);
+    res.json({ success: true, development: true, code });
 
   } catch (error) {
     console.error('Error sending verification code:', error);
-    res.status(500).json({
-      error: 'Failed to process verification code',
-      details: error.message
-    });
+    res.status(500).json({ error: 'Database error' });
   }
 });
 
@@ -147,33 +162,66 @@ app.post('/api/functions/sendVerificationCode', async (req, res) => {
 app.post('/api/functions/phoneLogin', async (req, res) => {
   const { phone: rawPhone, code } = req.body;
   const phone = normalizePhone(rawPhone);
-  const user = await prisma.user.findUnique({ where: { phone } });
 
-  if (!user || user.verification_code !== code) {
-    return res.status(400).json({ error: 'Invalid code' });
+  try {
+    const db = await connectDB();
+    const user = await db.collection('users').findOne({ phone });
+
+    if (!user || user.verification_code !== code) {
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    if (new Date() > new Date(user.verification_code_expires)) {
+      return res.status(400).json({ error: 'Code expired' });
+    }
+
+    // Clear code
+    await db.collection('users').updateOne(
+      { _id: user._id },
+      { $set: { verification_code: null, verification_code_expires: null } }
+    );
+
+    const token = generateToken(user);
+    const userResponse = {
+      ...user,
+      id: user._id.toString(),
+      roles: user.roles ? (typeof user.roles === 'string' ? JSON.parse(user.roles) : user.roles) : [],
+      role_prices: user.role_prices ? (typeof user.role_prices === 'string' ? JSON.parse(user.role_prices) : user.role_prices) : {},
+      has_password: !!user.password
+    };
+
+    res.json({ success: true, session_token: token, user: userResponse });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
   }
+});
 
-  if (new Date() > user.verification_code_expires) {
-    return res.status(400).json({ error: 'Code expired' });
-  }
+if (!user || user.verification_code !== code) {
+  return res.status(400).json({ error: 'Invalid code' });
+}
 
-  // Clear code
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { verification_code: null, verification_code_expires: null }
-  });
+if (new Date() > user.verification_code_expires) {
+  return res.status(400).json({ error: 'Code expired' });
+}
 
-  const token = generateToken(user);
+// Clear code
+await prisma.user.update({
+  where: { id: user.id },
+  data: { verification_code: null, verification_code_expires: null }
+});
 
-  // Format user for frontend
-  const userResponse = {
-    ...user,
-    roles: user.roles ? JSON.parse(user.roles) : [],
-    role_prices: user.role_prices ? JSON.parse(user.role_prices) : {},
-    has_password: !!user.password
-  };
+const token = generateToken(user);
 
-  res.json({ success: true, session_token: token, user: userResponse });
+// Format user for frontend
+const userResponse = {
+  ...user,
+  roles: user.roles ? JSON.parse(user.roles) : [],
+  role_prices: user.role_prices ? JSON.parse(user.role_prices) : {},
+  has_password: !!user.password
+};
+
+res.json({ success: true, session_token: token, user: userResponse });
 });
 
 // Password Login
